@@ -1,0 +1,341 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ---------------------------------------------------------------------------
+// Núcleo del negocio
+// ---------------------------------------------------------------------------
+
+model Location {
+  id     String  @id @default(cuid())
+  name   String  @unique // Torcoroma, Avenida Libertadores, Chapinero
+  active Boolean @default(true)
+
+  employees            Employee[]
+  users                User[]
+  dailySales           DailySale[]
+  bankTransfers        BankTransfer[]
+  cashClosings         CashClosing[]
+  expenses             Expense[]
+  warehouseDispatches  WarehouseDispatch[]
+  localInventoryCounts LocalInventoryCount[]
+
+  createdAt DateTime @default(now())
+}
+
+enum UserRole {
+  ADMIN // Ángela: acceso total
+  CUENTAS // Michelle: ve cuentas / reportes
+  OPERADOR_LOCAL // cajera: solo digita su propia caja/local
+  OPERADOR_BODEGA // bodeguero: solo digita bodega/despacho
+}
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         UserRole
+  locationId   String? // solo aplica a OPERADOR_LOCAL
+  location     Location? @relation(fields: [locationId], references: [id])
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Catálogo de productos y precios
+// ---------------------------------------------------------------------------
+
+enum ProductCategory {
+  PERRO
+  AMERICANO
+  SALCHIPAPA
+  BEBIDA
+  ADICIONAL
+  EMPAQUE
+  OTRO
+}
+
+model Product {
+  id           String          @id @default(cuid())
+  name         String // "Perrito 2 Salchichas", "Americano 1 Salchicha", "CocaCola 1.5L"...
+  category     ProductCategory
+  sausageCount Int? // salchichas que aporta una unidad vendida (para el total de consumo)
+  active       Boolean         @default(true)
+
+  prices ProductPrice[]
+  recipe Recipe[]
+  sales  DailySale[]
+
+  createdAt DateTime @default(now())
+}
+
+// Historial de precios: el precio vigente es el de mayor effectiveFrom <= fecha consultada.
+model ProductPrice {
+  id            String   @id @default(cuid())
+  productId     String
+  product       Product  @relation(fields: [productId], references: [id])
+  price         Float
+  effectiveFrom DateTime
+
+  @@index([productId, effectiveFrom])
+}
+
+// ---------------------------------------------------------------------------
+// Insumos y recetas (gramaje) — para comparar consumo teórico vs. real
+// ---------------------------------------------------------------------------
+
+model Ingredient {
+  id     String  @id @default(cuid())
+  name   String  @unique // PAN, SALCHICHA, QUESO, PIÑA, TOMATE, TARTARA, ...
+  unit   String // "unidad", "paquete", "bulto", "kg", "litro"
+  active Boolean @default(true)
+
+  recipeLines    Recipe[]
+  warehouseWeeks WarehouseWeek[]
+  localInventory LocalInventoryCount[]
+  stockTarget    StockTarget?
+
+  createdAt DateTime @default(now())
+}
+
+// Bill of materials: cuánto de un insumo lleva una unidad de un producto.
+model Recipe {
+  id              String     @id @default(cuid())
+  productId       String
+  product         Product    @relation(fields: [productId], references: [id])
+  ingredientId    String
+  ingredient      Ingredient @relation(fields: [ingredientId], references: [id])
+  quantityPerUnit Float // gramaje / cantidad por unidad vendida
+
+  @@unique([productId, ingredientId])
+}
+
+// ---------------------------------------------------------------------------
+// Ventas y cuadre de caja diario (reemplaza ENE-JUN / GANANCIA)
+// ---------------------------------------------------------------------------
+
+enum CajaTipo {
+  PRINCIPAL // atiende clientes en el local
+  WHATSAPP // atiende pedidos por WhatsApp
+}
+
+model DailySale {
+  id         String   @id @default(cuid())
+  date       DateTime // solo fecha (día operativo)
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+  cajaTipo   CajaTipo
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  quantity   Int
+  unitPrice  Float // precio vigente ese día (snapshot, aunque luego cambie el precio del producto)
+  amount     Float // quantity * unitPrice
+
+  createdAt DateTime @default(now())
+
+  @@index([locationId, date, cajaTipo])
+}
+
+model BankTransfer {
+  id         String   @id @default(cuid())
+  date       DateTime
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+  cajaTipo   CajaTipo
+  amount     Float
+  note       String? // ej: "Nequi", "Banco", nombre del cliente, etc.
+
+  createdAt DateTime @default(now())
+
+  @@index([locationId, date, cajaTipo])
+}
+
+// Cuadre de efectivo por caja y día. El efectivo esperado se calcula como:
+// (ventas totales de esa caja) - (transferencias de esa caja) - gastosDelDia - cena (si aplica)
+// y se compara contra countedCash.
+model CashClosing {
+  id          String    @id @default(cuid())
+  date        DateTime
+  locationId  String
+  location    Location  @relation(fields: [locationId], references: [id])
+  cajaTipo    CajaTipo
+  employeeId  String?
+  employee    Employee? @relation(fields: [employeeId], references: [id])
+  countedCash Float // lo que la cajera entregó realmente
+  difference  Float // countedCash - efectivoEsperado (se recalcula y guarda al cerrar el día)
+  note        String? // motivo del descuadre
+
+  createdAt DateTime @default(now())
+
+  @@unique([locationId, date, cajaTipo])
+}
+
+// ---------------------------------------------------------------------------
+// Gastos (reemplaza GASTOS)
+// ---------------------------------------------------------------------------
+
+enum ExpenseScope {
+  LOCAL // gasto propio de un local
+  BODEGA_COMPARTIDO // gasto de bodega que se reparte entre los locales activos
+}
+
+model Expense {
+  id          String       @id @default(cuid())
+  date        DateTime
+  scope       ExpenseScope
+  locationId  String? // null cuando scope = BODEGA_COMPARTIDO
+  location    Location?    @relation(fields: [locationId], references: [id])
+  category    String // "CENA EMPLEADOS", "PUBLICIDAD", "GASOLINA", "ARRIENDO", ...
+  amount      Float
+  description String?
+
+  createdAt DateTime @default(now())
+
+  @@index([date, locationId])
+}
+
+// ---------------------------------------------------------------------------
+// Nómina y préstamos (reemplaza NOMINA de ambos Excel + cuaderno de préstamos)
+// ---------------------------------------------------------------------------
+
+enum EmployeeGroup {
+  LOCAL
+  BODEGA
+}
+
+model Employee {
+  id          String        @id @default(cuid())
+  name        String
+  group       EmployeeGroup
+  role        String // "CAJERA_PRINCIPAL", "CAJERA_WHATSAPP", "BODEGUERO", "AYUDANTE_BODEGA", ...
+  locationId  String? // null para personal de bodega (su nómina se reparte entre locales)
+  location    Location?     @relation(fields: [locationId], references: [id])
+  payPerShift Float // lo que gana por turno/día trabajado
+  active      Boolean       @default(true)
+
+  payrollWeeks PayrollWeek[]
+  loans        Loan[]
+  cashClosings CashClosing[]
+
+  createdAt DateTime @default(now())
+}
+
+enum DayOfWeek {
+  LUN_FESTIVO
+  MIE
+  JUE
+  VIE
+  SAB
+  DOM
+}
+
+model PayrollWeek {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  weekStart  DateTime
+  basePay    Float // pago si trabaja la semana completa (suma de payPerShift de los días operativos)
+
+  days         PayrollDay[]
+  loanPayments LoanPayment[]
+
+  @@unique([employeeId, weekStart])
+}
+
+model PayrollDay {
+  id            String      @id @default(cuid())
+  payrollWeekId String
+  payrollWeek   PayrollWeek @relation(fields: [payrollWeekId], references: [id])
+  dayOfWeek     DayOfWeek
+  worked        Boolean     @default(true)
+  valeAmount    Float       @default(0) // adelanto pedido ese día
+
+  @@unique([payrollWeekId, dayOfWeek])
+}
+
+model Loan {
+  id         String   @id @default(cuid())
+  employeeId String
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  date       DateTime
+  amount     Float
+  note       String?
+
+  payments LoanPayment[]
+
+  createdAt DateTime @default(now())
+}
+
+model LoanPayment {
+  id            String      @id @default(cuid())
+  loanId        String
+  loan          Loan        @relation(fields: [loanId], references: [id])
+  payrollWeekId String
+  payrollWeek   PayrollWeek @relation(fields: [payrollWeekId], references: [id])
+  amount        Float
+}
+
+// ---------------------------------------------------------------------------
+// Bodega: compras, despacho e inventario (reemplaza BODEGA ACTUALIZADA / DESPACHO)
+// ---------------------------------------------------------------------------
+
+// Snapshot semanal de un insumo en la bodega: cuánto quedó, se compró y quedó de nuevo,
+// valorado a costo promedio ponderado.
+model WarehouseWeek {
+  id                String     @id @default(cuid())
+  ingredientId      String
+  ingredient        Ingredient @relation(fields: [ingredientId], references: [id])
+  weekStart         DateTime
+  openingQty        Float
+  openingAvgCost    Float // costo promedio ponderado con el que arrancó la semana
+  purchasedQty      Float      @default(0)
+  purchaseUnitCost  Float? // costo de la compra de esta semana (puede variar semana a semana)
+  avgUnitCost       Float // costo promedio ponderado recalculado tras la compra
+  internalUseQty    Float      @default(0) // insumos usados en producción interna (ej. tártara casera)
+  closingQtyCalc    Float // openingQty + purchasedQty - internalUseQty - total despachado
+  closingQtyCounted Float? // conteo físico real, cuando se hace inventario de bodega
+  isPhysicalCount   Boolean    @default(false)
+
+  dispatches WarehouseDispatch[]
+
+  @@unique([ingredientId, weekStart])
+}
+
+model WarehouseDispatch {
+  id              String        @id @default(cuid())
+  warehouseWeekId String
+  warehouseWeek   WarehouseWeek @relation(fields: [warehouseWeekId], references: [id])
+  locationId      String
+  location        Location      @relation(fields: [locationId], references: [id])
+  dayOfWeek       DayOfWeek
+  quantity        Float
+
+  @@unique([warehouseWeekId, locationId, dayOfWeek])
+}
+
+// Stock objetivo por insumo, usado para sugerir automáticamente cuánto comprar.
+model StockTarget {
+  id           String     @id @default(cuid())
+  ingredientId String     @unique
+  ingredient   Ingredient @relation(fields: [ingredientId], references: [id])
+  targetQty    Float
+}
+
+// Inventario físico semanal por local (domingo), para comparar consumo teórico vs. real.
+model LocalInventoryCount {
+  id           String     @id @default(cuid())
+  locationId   String
+  location     Location   @relation(fields: [locationId], references: [id])
+  ingredientId String
+  ingredient   Ingredient @relation(fields: [ingredientId], references: [id])
+  weekStart    DateTime
+  closingQty   Float // lo que quedó contado físicamente ese domingo
+
+  @@unique([locationId, ingredientId, weekStart])
+}
